@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",                      // Node.js 20 compatible
+    "module": "commonjs",                    // Node.js module system
+    "lib": ["ES2022", "DOM"],                // Available JS features + DOM for puppeteer
+    "outDir": "./dist",                      // Compiled JS goes here
+    "rootDir": "./src",                      // Source files location
+    "strict": true,                          // Enable all strict checks
+    "esModuleInterop": true,                 // Better import compatibility
+    "skipLibCheck": true,                    // Skip checking .d.ts files
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,               // Import JSON files
+    "noImplicitAny": true,                   // No implicit any types
+    "strictNullChecks": true,                // Explicit null handling
+    "sourceMap": true,                       // Debugging support
+    "types": ["node"],                       // Include Node.js types
+    "moduleResolution": "node"               // Node.js module resolution
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "tests"]
+}

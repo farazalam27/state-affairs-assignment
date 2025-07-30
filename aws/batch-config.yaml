@@ -1,0 +1,521 @@
+# AWS Infrastructure for Michigan Legislature Transcription
+# Hybrid approach: Lambda for small videos, EC2 Spot for large videos
+# Uses PostgreSQL as job queue (no SQS needed)
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Michigan Legislature Transcription - Cost-Optimized AWS Infrastructure'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+  
+  DatabaseUrl:
+    Type: String
+    Description: PostgreSQL connection string (stored in Secrets Manager)
+    NoEcho: true
+  
+  VideoSizeThreshold:
+    Type: Number
+    Default: 104857600  # 100MB in bytes
+    Description: Threshold to route videos to Lambda vs EC2
+
+Resources:
+  # S3 Bucket for video and transcription storage
+  VideoStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'michigan-legislature-videos-${Environment}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: IntelligentTiering
+            Status: Enabled
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 0
+          - Id: DeleteProcessedVideos
+            Status: Enabled
+            ExpirationInDays: 7
+            Prefix: videos/processed/
+          - Id: ArchiveOldVideos
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+            Prefix: videos/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Lambda Function for Small Video Processing (<100MB)
+  SmallVideoProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'michigan-small-video-processor-${Environment}'
+      Runtime: python3.11
+      Handler: processor.lambda_handler
+      MemorySize: 10240  # 10GB RAM (maximum)
+      Timeout: 900       # 15 minutes
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref VideoStorageBucket
+          WHISPER_MODEL: small
+          VIDEO_SIZE_THRESHOLD: !Ref VideoSizeThreshold
+          DATABASE_SECRET_ARN: !Ref DatabaseSecret
+      Code:
+        S3Bucket: !Sub 'michigan-deployment-${AWS::Region}'
+        S3Key: lambda/video-processor.zip
+      Layers:
+        - !Ref WhisperModelLayer
+        - !Ref FFmpegLayer
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  # Lambda Layers
+  WhisperModelLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub 'whisper-model-${Environment}'
+      Description: Whisper AI model files
+      Content:
+        S3Bucket: !Sub 'michigan-deployment-${AWS::Region}'
+        S3Key: layers/whisper-model.zip
+      CompatibleRuntimes:
+        - python3.11
+
+  FFmpegLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub 'ffmpeg-${Environment}'
+      Description: FFmpeg binaries for Lambda
+      Content:
+        S3Bucket: !Sub 'michigan-deployment-${AWS::Region}'
+        S3Key: layers/ffmpeg.zip
+      CompatibleRuntimes:
+        - python3.11
+
+  # EC2 Spot Fleet for Large Video Processing (>100MB)
+  SpotFleetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: spotfleet.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole
+
+  SpotFleetRequest:
+    Type: AWS::EC2::SpotFleet
+    Properties:
+      SpotFleetRequestConfigData:
+        IamFleetRole: !GetAtt SpotFleetRole.Arn
+        AllocationStrategy: diversified
+        TargetCapacity: 0  # Start with 0, auto-scale based on queue
+        SpotPrice: '0.10'  # Max price per hour
+        LaunchSpecifications:
+          - ImageId: !Ref LatestAmiId
+            InstanceType: c6a.2xlarge
+            KeyName: !Ref KeyPairName
+            IamInstanceProfile:
+              Arn: !GetAtt EC2InstanceProfile.Arn
+            SecurityGroups:
+              - GroupId: !Ref ProcessorSecurityGroup
+            UserData:
+              Fn::Base64: !Sub |
+                #!/bin/bash
+                # Install dependencies
+                yum update -y
+                yum install -y python3 python3-pip git ffmpeg
+                
+                # Install Python packages
+                pip3 install faster-whisper psycopg2-binary boto3
+                
+                # Clone processor code
+                git clone https://github.com/farazalam27/state-affairs-assignment.git /opt/processor
+                cd /opt/processor
+                
+                # Start processor
+                export DATABASE_SECRET_ARN=${DatabaseSecret}
+                export S3_BUCKET=${VideoStorageBucket}
+                export INSTANCE_TYPE=spot
+                python3 scripts/ec2_processor.py
+          - ImageId: !Ref LatestAmiId
+            InstanceType: c5.2xlarge
+            KeyName: !Ref KeyPairName
+            IamInstanceProfile:
+              Arn: !GetAtt EC2InstanceProfile.Arn
+            SecurityGroups:
+              - GroupId: !Ref ProcessorSecurityGroup
+            UserData:
+              Fn::Base64: !Sub |
+                #!/bin/bash
+                # Same as above
+          - ImageId: !Ref LatestAmiId
+            InstanceType: m5.2xlarge
+            KeyName: !Ref KeyPairName
+            IamInstanceProfile:
+              Arn: !GetAtt EC2InstanceProfile.Arn
+            SecurityGroups:
+              - GroupId: !Ref ProcessorSecurityGroup
+            UserData:
+              Fn::Base64: !Sub |
+                #!/bin/bash
+                # Same as above
+
+  # Auto Scaling for Spot Fleet
+  SpotFleetScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 10
+      MinCapacity: 0
+      ResourceId: !Sub 'spot-fleet-request/${SpotFleetRequest}'
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling'
+      ScalableDimension: 'ec2:spot-fleet-request:TargetCapacity'
+      ServiceNamespace: ec2
+
+  SpotFleetScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: QueueDepthScaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref SpotFleetScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 5.0  # Target 5 videos per instance
+        CustomizedMetricSpecification:
+          MetricName: LargeVideosInQueue
+          Namespace: MichiganProcessor
+          Statistic: Average
+
+  # Step Functions for Orchestration
+  ProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub 'michigan-processor-${Environment}'
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Michigan video processing orchestration",
+          "StartAt": "GetVideoSize",
+          "States": {
+            "GetVideoSize": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:s3:headObject",
+              "Parameters": {
+                "Bucket.$": "$.bucket",
+                "Key.$": "$.key"
+              },
+              "ResultPath": "$.videoMetadata",
+              "Next": "RouteBySize"
+            },
+            "RouteBySize": {
+              "Type": "Choice",
+              "Choices": [{
+                "Variable": "$.videoMetadata.ContentLength",
+                "NumericLessThan": ${VideoSizeThreshold},
+                "Next": "ProcessWithLambda"
+              }],
+              "Default": "ProcessWithEC2"
+            },
+            "ProcessWithLambda": {
+              "Type": "Task",
+              "Resource": "${SmallVideoProcessor.Arn}",
+              "ResultPath": "$.result",
+              "End": true,
+              "Retry": [{
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }]
+            },
+            "ProcessWithEC2": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+              "Parameters": {
+                "QueueUrl": "${LargeVideoQueue}",
+                "MessageBody": {
+                  "video.$": "$",
+                  "taskToken.$": "$$.Task.Token"
+                }
+              },
+              "ResultPath": "$.result",
+              "End": true,
+              "TimeoutSeconds": 7200
+            }
+          }
+        }
+
+  # Lambda for Scraping (runs on schedule)
+  ScraperFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'michigan-scraper-${Environment}'
+      Runtime: nodejs18.x
+      Handler: dist/lambda.handler
+      MemorySize: 3008
+      Timeout: 900
+      Environment:
+        Variables:
+          DATABASE_SECRET_ARN: !Ref DatabaseSecret
+          STATE_MACHINE_ARN: !Ref ProcessingStateMachine
+          FETCH_VIDEO_URLS: 'true'
+      Code:
+        S3Bucket: !Sub 'michigan-deployment-${AWS::Region}'
+        S3Key: lambda/scraper.zip
+      Layers:
+        - !Ref PuppeteerLayer
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  PuppeteerLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub 'puppeteer-chrome-${Environment}'
+      Description: Puppeteer with Chrome for Lambda
+      Content:
+        S3Bucket: !Sub 'michigan-deployment-${AWS::Region}'
+        S3Key: layers/puppeteer-chrome.zip
+      CompatibleRuntimes:
+        - nodejs18.x
+
+  # CloudWatch Schedule
+  ScraperSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'michigan-scraper-schedule-${Environment}'
+      Description: Run scraper every 6 hours
+      ScheduleExpression: 'rate(6 hours)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ScraperFunction.Arn
+          Id: '1'
+
+  ScraperSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScraperFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScraperSchedule.Arn
+
+  # Database Secret
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub 'michigan-db-url-${Environment}'
+      Description: PostgreSQL connection string
+      SecretString: !Ref DatabaseUrl
+
+  # CloudWatch Log Groups
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/michigan-processor-${Environment}'
+      RetentionInDays: 7
+
+  EC2LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ec2/michigan-processor-${Environment}'
+      RetentionInDays: 7
+
+  # Monitoring Dashboard
+  ProcessingDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'michigan-processor-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", {"stat": "Sum"}],
+                  [".", "Errors", {"stat": "Sum"}],
+                  [".", "Duration", {"stat": "Average"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Processing"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["MichiganProcessor", "VideosProcessed", {"stat": "Sum"}],
+                  [".", "ProcessingTime", {"stat": "Average"}],
+                  [".", "QueueDepth", {"stat": "Average"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Processing Metrics"
+              }
+            }
+          ]
+        }
+
+  # Security Group
+  ProcessorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 'michigan-processor-${Environment}'
+      GroupDescription: Security group for video processors
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # IAM Roles
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${VideoStorageBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DatabaseSecret
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref ProcessingStateMachine
+
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: ProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${VideoStorageBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DatabaseSecret
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                Resource: !GetAtt LargeVideoQueue.Arn
+              - Effect: Allow
+                Action:
+                  - states:SendTaskSuccess
+                  - states:SendTaskFailure
+                Resource: '*'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt SmallVideoProcessor.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt LargeVideoQueue.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:HeadObject
+                Resource: !Sub '${VideoStorageBucket.Arn}/*'
+
+  # SQS Queue for Large Videos (internal coordination only)
+  LargeVideoQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'michigan-large-videos-${Environment}'
+      VisibilityTimeout: 7200  # 2 hours
+      MessageRetentionPeriod: 86400  # 1 day
+
+  # Parameters
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access
+
+Outputs:
+  VideoBucket:
+    Description: S3 bucket for video storage
+    Value: !Ref VideoStorageBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-VideoBucket'
+  
+  ScraperFunction:
+    Description: Lambda function for scraping
+    Value: !Ref ScraperFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ScraperFunction'
+  
+  StateMachine:
+    Description: Step Functions state machine ARN
+    Value: !Ref ProcessingStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachine'
+  
+  DashboardURL:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProcessingDashboard}'

@@ -1,0 +1,131 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: michigan-postgres
+    environment:
+      POSTGRES_DB: michigan_hearings
+      POSTGRES_USER: michigan_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U michigan_user -d michigan_hearings"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  processor:
+    build: .
+    container_name: michigan-processor
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Database
+      DATABASE_URL: postgresql://michigan_user:${DB_PASSWORD:-changeme}@postgres:5432/michigan_hearings
+      
+      # State configuration
+      STATE: ${STATE:-michigan}
+      
+      # Transcription - Using local Whisper for free operation
+      TRANSCRIPTION_SERVICE: ${TRANSCRIPTION_SERVICE:-local}
+      WHISPER_MODEL: ${WHISPER_MODEL:-base}
+      DELETE_AFTER_TRANSCRIPTION: ${DELETE_AFTER_TRANSCRIPTION:-true}
+      KEEP_AUDIO_FILES: ${KEEP_AUDIO_FILES:-false}
+      PRESERVE_DOTS: ${PRESERVE_DOTS:-false}
+      
+      # Storage paths
+      VIDEO_STORAGE_PATH: /app/tmp/videos
+      TRANSCRIPTION_STORAGE_PATH: /app/transcriptions
+      
+      # Scheduling
+      CRON_SCHEDULE: ${CRON_SCHEDULE:-0 2 * * *}
+      RUN_ON_START: ${RUN_ON_START:-false}
+      RUN_ONCE: ${RUN_ONCE:-false}
+      
+      # Processing limits
+      MAX_HEARINGS_PER_RUN: ${MAX_HEARINGS_PER_RUN:-1}
+      
+      # House scraper configuration
+      HOUSE_SCRAPE_YEAR: ${HOUSE_SCRAPE_YEAR:-2025}
+      
+      # Senate scraper configuration
+      SENATE_PAGE_SIZE: ${SENATE_PAGE_SIZE:-20}
+      SENATE_MAX_PAGES: ${SENATE_MAX_PAGES:-1}
+      
+      # Monitoring
+      HEALTH_CHECK_PORT: 3000
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      NODE_ENV: production
+    volumes:
+      - ./tmp/videos:/app/tmp/videos
+      - ./transcriptions:/app/transcriptions
+      - whisper_cache:/app/.cache
+    ports:
+      - "3000:3000"  # Health check endpoint
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Resource limits for production
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+  # Fast transcription processor (optional - runs alongside main processor)
+  fast-processor:
+    build: .
+    container_name: michigan-fast-processor
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://michigan_user:${DB_PASSWORD:-changeme}@postgres:5432/michigan_hearings
+      VIDEO_STORAGE_PATH: /app/tmp/videos
+      TRANSCRIPTION_STORAGE_PATH: /app/transcriptions
+      WHISPER_MODEL: ${WHISPER_MODEL:-small}
+      DELETE_AFTER_TRANSCRIPTION: ${DELETE_AFTER_TRANSCRIPTION:-true}
+      WHISPER_WORKERS: ${WHISPER_WORKERS:-8}
+    volumes:
+      - ./tmp/videos:/app/tmp/videos
+      - ./transcriptions:/app/transcriptions
+    command: python scripts/docker_fast_processor.py --continuous
+    restart: unless-stopped
+    profiles:
+      - fast
+    deploy:
+      resources:
+        limits:
+          memory: 16G
+          cpus: '8.0'
+        reservations:
+          memory: 8G
+          cpus: '4.0'
+
+  # Optional: Adminer for database management
+  adminer:
+    image: adminer:latest
+    container_name: michigan-adminer
+    depends_on:
+      - postgres
+    ports:
+      - "8080:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    profiles:
+      - debug
+
+volumes:
+  postgres_data:
+  whisper_cache:
