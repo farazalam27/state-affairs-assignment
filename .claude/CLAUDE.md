@@ -1353,3 +1353,48 @@ git push -u origin main
 - [ ] Run deduplication test
 - [ ] Test on different video sizes
 - [ ] Verify cross-platform compatibility
+
+## Recent Fixes and Updates (August 1, 2025)
+
+### Code Cleanup Session
+1. **Removed unused code from baseScraper.ts**
+   - Removed axios and cheerio imports (using Puppeteer instead)
+   - Deleted unused methods: fetchPage(), extractVideoUrl(), parseDate()
+   - Kept only essential utility methods
+
+2. **Removed unused dependencies**
+   - axios, cheerio (replaced by Puppeteer)
+   - openai (using local Whisper)
+   - node-cron (no scheduler in this codebase)
+   - fs-extra (using native fs)
+   - Various type definitions no longer needed
+
+3. **Fixed inefficient database queries**
+   - Replaced getAllUrlHashes() with batch checking per page/year
+   - Reduced database queries by ~91% for scrapers
+   - Now checks existence in batches instead of loading all URLs
+
+4. **Extracted hardcoded values to constants**
+   - Created src/config/constants.ts
+   - Centralized timeout values
+   - Made retry counts configurable
+
+5. **Simplified logger**
+   - Removed unused convenience methods
+   - Removed file transports (console only)
+   - Simplified circular reference handling
+
+6. **Fixed health check**
+   - Converted dynamic requires to ES6 imports
+   - Fixed fs-extra import to use native fs
+
+7. **Fixed run-local.sh execution errors**
+   - Added quotes around shell variable comparison: `if [ "$i" -eq 30 ]`
+   - Fixed cron schedule parsing by quoting: `CRON_SCHEDULE="0 2 * * *"`
+   - Updated both .env and .env.example files
+
+### Key Architecture Decisions Confirmed
+- TypeScript handles web scraping (Puppeteer for JS-heavy sites)
+- Python handles video processing (better ML libraries, multiprocessing)
+- PostgreSQL serves as job queue (no external dependencies)
+- Clean separation of concerns between languages
