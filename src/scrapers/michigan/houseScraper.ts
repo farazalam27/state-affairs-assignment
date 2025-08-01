@@ -2,6 +2,7 @@ import { BaseScraper, Hearing } from '../baseScraper';
 import { logger } from '../../utils/logger';
 import puppeteer from 'puppeteer';
 import { hearingDb } from '../../database/db';
+import { TIMEOUTS, RETRIES } from '../../config/constants';
 
 export class HouseScraper extends BaseScraper {
     private readonly baseUrl = 'https://house.mi.gov/VideoArchive';
@@ -34,15 +35,10 @@ export class HouseScraper extends BaseScraper {
             logger.info(`Starting House scraper for years ${this.startYear}-${this.endYear}`);
             const allHearings: Hearing[] = [];
             let newVideosFound = 0;
-            let existingUrlHashes = new Set<string>();
             
-            // If we have a limit on new videos, preload existing URLs to check against
+            // If we have a limit on new videos, we'll check each one individually
             if (this.maxNewVideos > 0) {
                 logger.info(`Smart limit enabled: looking for ${this.maxNewVideos} new videos`);
-                // Get all existing URL hashes from database
-                const allExisting = await hearingDb.getAllUrlHashes();
-                existingUrlHashes = new Set(allExisting);
-                logger.info(`Found ${existingUrlHashes.size} existing videos in database`);
             }
             
             const page = await browser.newPage();
@@ -50,11 +46,11 @@ export class HouseScraper extends BaseScraper {
             // Navigate to the House video archive
             await page.goto(this.baseUrl, {
                 waitUntil: 'networkidle2',
-                timeout: 30000
+                timeout: TIMEOUTS.NAVIGATION
             });
             
             // Wait for the page to load
-            await page.waitForSelector('#FilterYear', { timeout: 10000 });
+            await page.waitForSelector('#FilterYear', { timeout: TIMEOUTS.ELEMENT_WAIT });
 
             // Iterate through each year in reverse order (newest first)
             for (let year = this.endYear; year >= this.startYear; year--) {
@@ -64,11 +60,11 @@ export class HouseScraper extends BaseScraper {
                 await page.select('#FilterYear', year.toString());
                 
                 // Wait 1-2 seconds to ensure selection is registered
-                await new Promise(resolve => setTimeout(resolve, 1500));
+                await new Promise(resolve => setTimeout(resolve, TIMEOUTS.YEAR_SELECT));
                 
                 // Try clicking filter button up to 3 times
                 let filterSuccess = false;
-                for (let attempt = 1; attempt <= 3; attempt++) {
+                for (let attempt = 1; attempt <= RETRIES.FILTER_BUTTON; attempt++) {
                     logger.debug(`Filter button click attempt ${attempt}/3 for year ${year}`);
                     
                     const filterButton = await page.$('#FilterCommand');
@@ -94,7 +90,7 @@ export class HouseScraper extends BaseScraper {
                         break;
                     } else if (attempt < 3) {
                         logger.debug(`Year mismatch in results, retrying filter...`);
-                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        await new Promise(resolve => setTimeout(resolve, TIMEOUTS.SCRAPER_RETRY));
                     }
                 }
                 
@@ -148,40 +144,48 @@ export class HouseScraper extends BaseScraper {
                 
                 logger.info(`Found ${yearHearings.length} videos for year ${year}`);
                 
-                // Process the extracted data
-                let yearNewVideos = 0;
+                // Parse all videos first
+                const parsedHearings: Hearing[] = [];
                 for (const data of yearHearings) {
                     const hearing = this.parseVideoData(data);
                     if (hearing) {
-                        // Check if this is a new video
-                        const isNew = this.maxNewVideos <= 0 || !existingUrlHashes.has(hearing.urlHash);
+                        parsedHearings.push(hearing);
+                    }
+                }
+                
+                // Batch check which videos already exist
+                let newHearings = parsedHearings;
+                if (this.maxNewVideos > 0 && parsedHearings.length > 0) {
+                    const urlHashes = parsedHearings.map(h => h.urlHash);
+                    const existingHashes = await hearingDb.existsBatch(urlHashes);
+                    newHearings = parsedHearings.filter(h => !existingHashes.has(h.urlHash));
+                    logger.info(`Batch check: ${newHearings.length} new videos out of ${parsedHearings.length} total`);
+                }
+                
+                // Process only new videos
+                let yearNewVideos = 0;
+                for (const hearing of newHearings) {
+                    // Optionally fetch video URL immediately
+                    if (process.env.FETCH_VIDEO_URLS_DURING_SCRAPE === 'true' && !hearing.videoUrl) {
+                        try {
+                            logger.debug(`Fetching video URL for: ${hearing.title}`);
+                            hearing.videoUrl = await this.fetchVideoUrl(hearing);
+                        } catch (error) {
+                            logger.warn(`Failed to fetch video URL during scrape: ${hearing.title}`, error);
+                        }
+                    }
+                    
+                    allHearings.push(hearing);
+                    yearNewVideos++;
+                    
+                    if (this.maxNewVideos > 0) {
+                        newVideosFound++;
+                        logger.info(`New videos found: ${newVideosFound}/${this.maxNewVideos}`);
                         
-                        if (isNew) {
-                            // Optionally fetch video URL immediately
-                            if (process.env.FETCH_VIDEO_URLS_DURING_SCRAPE === 'true' && !hearing.videoUrl) {
-                                try {
-                                    logger.debug(`Fetching video URL for: ${hearing.title}`);
-                                    hearing.videoUrl = await this.fetchVideoUrl(hearing);
-                                } catch (error) {
-                                    logger.warn(`Failed to fetch video URL during scrape: ${hearing.title}`, error);
-                                }
-                            }
-                            
-                            allHearings.push(hearing);
-                            yearNewVideos++;
-                            
-                            if (this.maxNewVideos > 0) {
-                                newVideosFound++;
-                                logger.info(`New videos found: ${newVideosFound}/${this.maxNewVideos}`);
-                                
-                                // Stop if we've found enough new videos
-                                if (newVideosFound >= this.maxNewVideos) {
-                                    logger.info(`Reached limit of ${this.maxNewVideos} new videos, stopping scrape`);
-                                    break;
-                                }
-                            }
-                        } else {
-                            logger.debug(`Skipping existing video: ${hearing.title}`);
+                        // Stop if we've found enough new videos
+                        if (newVideosFound >= this.maxNewVideos) {
+                            logger.info(`Reached limit of ${this.maxNewVideos} new videos, stopping scrape`);
+                            break;
                         }
                     }
                 }
@@ -236,46 +240,6 @@ export class HouseScraper extends BaseScraper {
         }
     }
     
-    private parseVideoElement($: any, element: any): Hearing | null {
-        try {
-            const $element = $(element);
-            
-            // Extract link element first
-            const linkElement = $element.find('a').first();
-            const relativeUrl = linkElement.attr('href');
-            
-            if (!relativeUrl) {
-                logger.debug('No link found in video element');
-                return null;
-            }
-            
-            // Extract title from link text
-            const title = this.cleanText(linkElement.text());
-            
-            if (!title) {
-                logger.debug('Missing title in video element');
-                return null;
-            }
-            
-            // The sourceUrl should be the VideoArchivePlayer URL
-            const sourceUrl = this.makeAbsoluteUrl(relativeUrl);
-            const urlHash = this.generateUrlHash(sourceUrl);
-
-            const hearing: Hearing = {
-                sourceUrl,
-                urlHash,
-                title,
-                chamber: this.chamber
-            };
-
-            logger.debug(`Parsed hearing: ${title} (${sourceUrl})`);
-            return hearing;
-
-        } catch (error) {
-            logger.warn('Failed to parse video element', error);
-            return null;
-        }
-    }
 
     // Override to fetch video URL from detail page
     async fetchVideoUrl(hearing: Hearing): Promise<string | undefined> {

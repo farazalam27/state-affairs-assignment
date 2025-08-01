@@ -94,20 +94,6 @@ export interface HearingRecord {
 
 // Hearing-specific database operations
 export const hearingDb = {
-    // Check if a URL has already been processed
-    async exists(url: string): Promise<boolean> {
-        const result = await db.query(
-            'SELECT id FROM hearings WHERE source_url = $1',
-            [url]
-        );
-        return result.rows.length > 0;
-    },
-
-    // Get all URL hashes in database
-    async getAllUrlHashes(): Promise<string[]> {
-        const result = await db.query('SELECT url_hash FROM hearings');
-        return result.rows.map(row => row.url_hash);
-    },
 
     // Batch check if URLs exist - returns Set of existing URL hashes
     async existsBatch(urlHashes: string[]): Promise<Set<string>> {
@@ -131,9 +117,7 @@ export const hearingDb = {
         title?: string;
         chamber: 'house' | 'senate';
         videoUrl?: string;
-        state?: string;
     }) {
-        const state = hearing.state || process.env.STATE || 'MI';
         const result = await db.query(
             `INSERT INTO hearings 
        (source_url, url_hash, title, chamber, url)
@@ -157,11 +141,8 @@ export const hearingDb = {
         title?: string;
         chamber: 'house' | 'senate';
         videoUrl?: string;
-        state?: string;
     }>): Promise<number> {
         if (hearings.length === 0) return 0;
-        
-        const state = process.env.STATE || 'MI';
         
         // Build VALUES clause with parameterized placeholders
         const values: any[] = [];
@@ -254,20 +235,4 @@ export const hearingDb = {
 
         await db.query(query, values);
     },
-
-    // Log processing action - commented out as processing_logs table was removed
-    // async logAction(
-    //     hearingId: string,
-    //     action: string,
-    //     status: string,
-    //     details?: any,
-    //     errorMessage?: string
-    // ) {
-    //     await db.query(
-    //         `INSERT INTO processing_logs 
-    //    (hearing_id, action, status, details, error_message)
-    //    VALUES ($1, $2, $3, $4, $5)`,
-    //         [hearingId, action, status, JSON.stringify(details), errorMessage]
-    //     );
-    // }
 };

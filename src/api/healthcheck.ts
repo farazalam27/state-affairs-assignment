@@ -1,6 +1,11 @@
 import { createServer, IncomingMessage, ServerResponse } from 'http';
 import { db } from '../database/db';
 import { logger } from '../utils/logger';
+import * as fs from 'fs';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+
+const execAsync = promisify(exec);
 
 interface HealthStatus {
     status: 'healthy' | 'unhealthy';
@@ -71,14 +76,10 @@ export class HealthCheckServer {
             health.checks.database = await db.isConnected();
             
             // Check storage directories
-            const fs = require('fs-extra');
-            health.checks.storage = await fs.pathExists('./tmp/videos') &&
-                                   await fs.pathExists('./transcriptions');
+            health.checks.storage = fs.existsSync('./tmp/videos') &&
+                                   fs.existsSync('./transcriptions');
             
             // Check Python Whisper availability
-            const { exec } = require('child_process');
-            const { promisify } = require('util');
-            const execAsync = promisify(exec);
             
             try {
                 await execAsync('python3 -c "import faster_whisper"');

@@ -1,11 +1,9 @@
-import * as cron from 'node-cron';
 import dotenv from 'dotenv';
 import { db, hearingDb } from './database/db';
 import { logger } from './utils/logger';
 import { HouseScraper } from './scrapers/michigan/houseScraper';
 import { SenateScraper } from './scrapers/michigan/senateScraper';
 import { Hearing } from './scrapers/baseScraper';
-import { VideoProcessor } from './processors/videoProcessor';
 import { HealthCheckServer } from './api/healthcheck';
 
 // Load environment variables
@@ -14,16 +12,12 @@ dotenv.config();
 class MichiganHearingsProcessor {
     private houseScraper: HouseScraper;
     private senateScraper: SenateScraper;
-    private videoProcessor: VideoProcessor;
     private isProcessing: boolean = false;
-    private shouldStop: boolean = false;
-    private cronJob: cron.ScheduledTask | null = null;
     private healthCheckServer: HealthCheckServer;
 
     constructor() {
         this.houseScraper = new HouseScraper();
         this.senateScraper = new SenateScraper();
-        this.videoProcessor = new VideoProcessor();
         this.healthCheckServer = new HealthCheckServer();
     }
 
@@ -40,15 +34,12 @@ class MichiganHearingsProcessor {
         // Log configuration
         logger.info('Configuration:', {
             videoStoragePath: process.env.VIDEO_STORAGE_PATH || './tmp/videos',
-            cronSchedule: process.env.CRON_SCHEDULE || '0 2 * * *',
             maxHearingsPerRun: process.env.MAX_HEARINGS_PER_RUN || '-1'
         });
     }
 
     // Start the scheduled processor
     async start(): Promise<void> {
-        const schedule = process.env.CRON_SCHEDULE || '0 2 * * *'; // Default: 2 AM daily
-        
         // Start health check server
         const healthPort = parseInt(process.env.HEALTH_CHECK_PORT || '3000');
         await this.healthCheckServer.start(healthPort);
@@ -58,16 +49,7 @@ class MichiganHearingsProcessor {
             logger.info('Running initial processing...');
             await this.process();
         }
-        
-        // Set up cron job
-        this.cronJob = cron.schedule(schedule, async () => {
-            if (!this.shouldStop) {
-                await this.process();
-            }
-        });
-        
-        logger.info(`Scheduled processor started with cron: ${schedule}`);
-        
+
         // Set up graceful shutdown
         this.setupGracefulShutdown();
     }
@@ -75,12 +57,7 @@ class MichiganHearingsProcessor {
     // Stop the processor
     async stop(): Promise<void> {
         logger.info('Stopping processor...');
-        this.shouldStop = true;
-        
-        if (this.cronJob) {
-            this.cronJob.stop();
-        }
-        
+
         // Stop health check server
         await this.healthCheckServer.stop();
         
@@ -113,16 +90,8 @@ class MichiganHearingsProcessor {
                 [JSON.stringify({ timestamp: new Date().toISOString() })]
             );
 
-            // Step 1: Scrape for new hearings
+            // Scrape for new hearings
             await this.scrapeNewHearings();
-
-            // Step 2: Download pending videos (unless SKIP_DOWNLOAD is set)
-            if (process.env.SKIP_DOWNLOAD !== 'true') {
-                await this.downloadPendingVideos();
-                
-                // Step 3: Transcribe downloaded videos
-                await this.transcribePendingVideos();
-            }
 
             const duration = Date.now() - startTime;
             logger.info(`Processing completed in ${duration}ms`);
@@ -256,47 +225,6 @@ class MichiganHearingsProcessor {
         if (hearingsToInsert.length > 0) {
             const insertedCount = await hearingDb.createBatch(hearingsToInsert);
             logger.info(`Successfully inserted ${insertedCount} new hearings into database`);
-        }
-    }
-
-    // Download videos that haven't been downloaded yet
-    private async downloadPendingVideos(): Promise<void> {
-        // Apply MAX_HEARINGS_PER_RUN limit at download time
-        const maxHearingsPerRun = parseInt(process.env.MAX_HEARINGS_PER_RUN || '-1');
-        const limit = maxHearingsPerRun > 0 ? maxHearingsPerRun : 100; // Default to 100 if unlimited
-        
-        const pendingHearings = await hearingDb.getPendingHearings(limit);
-        logger.info(`Found ${pendingHearings.length} videos to download (limit: ${maxHearingsPerRun > 0 ? maxHearingsPerRun : 'unlimited'})`);
-
-        for (let i = 0; i < pendingHearings.length; i++) {
-            if (this.shouldStop) break;
-            
-            const hearing = pendingHearings[i];
-            logger.info(`Downloading video ${i + 1}/${pendingHearings.length}: ${hearing.title}`);
-            
-            try {
-                await this.videoProcessor.downloadVideo(hearing);
-            } catch (error) {
-                logger.error(`Failed to download video for hearing ${hearing.id}`, error);
-            }
-        }
-    }
-
-    // Transcribe videos that have been downloaded
-    private async transcribePendingVideos(): Promise<void> {
-        // Transcription is now handled by Python parallel_processor.py
-        // This method is kept for compatibility but does nothing
-        logger.info('Transcription is handled by Python parallel_processor.py');
-        
-        // Log pending transcriptions for visibility
-        const result = await db.query(
-            `SELECT COUNT(*) as count FROM hearings 
-             WHERE download_status = 'completed' 
-               AND transcription_status = 'pending'`
-        );
-        
-        if (result.rows[0].count > 0) {
-            logger.info(`${result.rows[0].count} videos pending transcription - run parallel_processor.py to process them`);
         }
     }
 

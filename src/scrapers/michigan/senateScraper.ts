@@ -2,6 +2,7 @@ import { BaseScraper, Hearing } from '../baseScraper';
 import { logger } from '../../utils/logger';
 import puppeteer from 'puppeteer';
 import { hearingDb } from '../../database/db';
+import { TIMEOUTS, RETRIES, SENATE_CONFIG, LOGGING } from '../../config/constants';
 
 export class SenateScraper extends BaseScraper {
     private readonly baseUrl = 'https://cloud.castus.tv/vod/misenate/';
@@ -33,15 +34,10 @@ export class SenateScraper extends BaseScraper {
             logger.info('Starting Senate scraper with Puppeteer');
             const hearings: Hearing[] = [];
             let newVideosFound = 0;
-            let existingUrlHashes = new Set<string>();
             
-            // If we have a limit on new videos, preload existing URLs to check against
+            // If we have a limit on new videos, we'll check each one individually
             if (this.maxNewVideos > 0) {
                 logger.info(`Smart limit enabled: looking for ${this.maxNewVideos} new videos`);
-                // Get all existing URL hashes from database
-                const allExisting = await hearingDb.getAllUrlHashes();
-                existingUrlHashes = new Set(allExisting);
-                logger.info(`Found ${existingUrlHashes.size} existing videos in database`);
             }
             
             const page = await browser.newPage();
@@ -52,19 +48,19 @@ export class SenateScraper extends BaseScraper {
             
             await page.goto(url, { 
                 waitUntil: 'networkidle2',
-                timeout: 30000 
+                timeout: TIMEOUTS.NAVIGATION 
             });
             
             // Wait for video container to load
             await page.waitForSelector('.row.mb-3.border-bottom', {
-                timeout: 10000
+                timeout: TIMEOUTS.ELEMENT_WAIT
             }).catch(() => {
                 logger.warn('Could not find video container, trying alternative approach');
             });
             
             // Extra wait for initial page content to fully load
             logger.info('Waiting for initial page content to load...');
-            await new Promise(resolve => setTimeout(resolve, 6000));
+            await new Promise(resolve => setTimeout(resolve, TIMEOUTS.INITIAL_LOAD));
             
             // Optionally set page size to 10 or 20 (NOT 50)
             try {
@@ -101,7 +97,7 @@ export class SenateScraper extends BaseScraper {
             
             while (hasMorePages && (this.maxPages === -1 || currentPage <= this.maxPages)) {
                 // Log progress every 10 pages
-                if (currentPage % 10 === 0 || currentPage === 1) {
+                if (currentPage % LOGGING.PAGE_LOG_INTERVAL === 0 || currentPage === 1) {
                     logger.info(`Scraping Senate page ${currentPage}/${totalPages} (${hearings.length} videos so far)`);
                 } else {
                     logger.debug(`Scraping Senate page ${currentPage}`);
@@ -228,47 +224,53 @@ export class SenateScraper extends BaseScraper {
                 
                 logger.info(`Found ${videoData.length} videos on page ${currentPage}`);
                 
-                // Process video data
+                // Create hearing objects for all videos on this page
+                const pageHearings: Hearing[] = [];
                 for (const video of videoData) {
                     const urlHash = this.generateUrlHash(video.sourceUrl);
-                    
-                    // Check if this is a new video
-                    const isNew = this.maxNewVideos <= 0 || !existingUrlHashes.has(urlHash);
-                    
-                    if (isNew) {
-                        const hearing: Hearing = {
-                            sourceUrl: video.sourceUrl,
-                            urlHash: urlHash,
-                            title: this.cleanText(video.title),
-                            chamber: this.chamber
-                        };
-                        
-                        // Optionally fetch video URL immediately
-                        if (process.env.FETCH_VIDEO_URLS_DURING_SCRAPE === 'true') {
-                            try {
-                                logger.debug(`Fetching video URL for: ${hearing.title}`);
-                                hearing.videoUrl = await this.fetchVideoUrl(hearing);
-                            } catch (error) {
-                                logger.warn(`Failed to fetch video URL during scrape: ${hearing.title}`, error);
-                            }
+                    const hearing: Hearing = {
+                        sourceUrl: video.sourceUrl,
+                        urlHash: urlHash,
+                        title: this.cleanText(video.title),
+                        chamber: this.chamber
+                    };
+                    pageHearings.push(hearing);
+                }
+                
+                // Batch check which videos already exist
+                let newHearings = pageHearings;
+                if (this.maxNewVideos > 0 && pageHearings.length > 0) {
+                    const urlHashes = pageHearings.map(h => h.urlHash);
+                    const existingHashes = await hearingDb.existsBatch(urlHashes);
+                    newHearings = pageHearings.filter(h => !existingHashes.has(h.urlHash));
+                    logger.info(`Page ${currentPage} batch check: ${newHearings.length} new videos out of ${pageHearings.length} total`);
+                }
+                
+                // Process only new videos
+                for (const hearing of newHearings) {
+                    // Optionally fetch video URL immediately
+                    if (process.env.FETCH_VIDEO_URLS_DURING_SCRAPE === 'true') {
+                        try {
+                            logger.debug(`Fetching video URL for: ${hearing.title}`);
+                            hearing.videoUrl = await this.fetchVideoUrl(hearing);
+                        } catch (error) {
+                            logger.warn(`Failed to fetch video URL during scrape: ${hearing.title}`, error);
                         }
+                    }
+                    
+                    hearings.push(hearing);
+                    logger.debug(`Found new Senate hearing: ${hearing.title}`);
+                    
+                    if (this.maxNewVideos > 0) {
+                        newVideosFound++;
+                        logger.info(`New videos found: ${newVideosFound}/${this.maxNewVideos}`);
                         
-                        hearings.push(hearing);
-                        logger.debug(`Found new Senate hearing: ${hearing.title}`);
-                        
-                        if (this.maxNewVideos > 0) {
-                            newVideosFound++;
-                            logger.info(`New videos found: ${newVideosFound}/${this.maxNewVideos}`);
-                            
-                            // Stop if we've found enough new videos
-                            if (newVideosFound >= this.maxNewVideos) {
-                                logger.info(`Reached limit of ${this.maxNewVideos} new videos, stopping scrape`);
-                                hasMorePages = false;
-                                break;
-                            }
+                        // Stop if we've found enough new videos
+                        if (newVideosFound >= this.maxNewVideos) {
+                            logger.info(`Reached limit of ${this.maxNewVideos} new videos, stopping scrape`);
+                            hasMorePages = false;
+                            break;
                         }
-                    } else {
-                        logger.debug(`Skipping existing video: ${video.title}`);
                     }
                 }
                 
@@ -304,7 +306,7 @@ export class SenateScraper extends BaseScraper {
                             
                             // Wait for the video container to be present
                             await page.waitForSelector('.row.mb-3.border-bottom', {
-                                timeout: 10000
+                                timeout: TIMEOUTS.ELEMENT_WAIT
                             });
                         } else {
                             logger.warn('Next page button not found');
@@ -330,60 +332,6 @@ export class SenateScraper extends BaseScraper {
         }
     }
 
-    private parseVideoElement($: any, element: any): Hearing | null {
-        try {
-            const $element = $(element);
-            
-            // Extract video ID from thumbnail URL
-            const thumbnailImg = $element.find('img').first();
-            const thumbnailSrc = thumbnailImg.attr('src');
-            
-            if (!thumbnailSrc) {
-                logger.debug('No thumbnail found in video element');
-                return null;
-            }
-            
-            // Extract ID from URL like: https://dlttx48mxf9m3.cloudfront.net/outputs/{id}/Default/Thumbnails/out_003.png
-            const idMatch = thumbnailSrc.match(/\/outputs\/([a-z0-9]+)\//i);
-            if (!idMatch || !idMatch[1]) {
-                logger.debug('Could not extract video ID from thumbnail URL');
-                return null;
-            }
-            
-            const videoId = idMatch[1];
-            
-            // Build the video page URL
-            const sourceUrl = `${this.baseUrl}video/${videoId}?page=HOME`;
-            
-            // Extract title from alt text or nearby text
-            const title = this.cleanText(
-                thumbnailImg.attr('alt') || 
-                $element.find('.title, h3, h4, .video-title').text() ||
-                $element.text()
-            );
-            
-            if (!title) {
-                logger.debug('No title found for video');
-                return null;
-            }
-            
-            const urlHash = this.generateUrlHash(sourceUrl);
-
-            const hearing: Hearing = {
-                sourceUrl,
-                urlHash,
-                title,
-                chamber: this.chamber
-            };
-
-            logger.debug(`Parsed Senate hearing: ${title} (ID: ${videoId})`);
-            return hearing;
-
-        } catch (error) {
-            logger.warn('Failed to parse Senate video element', error);
-            return null;
-        }
-    }
 
     // Override to fetch video URL from detail page
     async fetchVideoUrl(hearing: Hearing): Promise<string | undefined> {
