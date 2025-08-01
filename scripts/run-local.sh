@@ -95,7 +95,7 @@ for i in {1..30}; do
         echo "✅ Database is ready!"
         break
     fi
-    if [ $i -eq 30 ]; then
+    if [ "$i" -eq 30 ]; then
         echo "❌ Database failed to start after 30 seconds"
         exit 1
     fi
